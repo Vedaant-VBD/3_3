@@ -7,14 +7,15 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
 
-from google import genai
-from google.genai import types
 
+# ==================================================
+# FastAPI App
+# ==================================================
 
 app = FastAPI()
 
-# CORS (IMPORTANT for testing)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,9 +25,9 @@ app.add_middleware(
 )
 
 
-# =========================
+# ==================================================
 # Models
-# =========================
+# ==================================================
 
 class CodeRequest(BaseModel):
     code: str
@@ -41,9 +42,9 @@ class ErrorAnalysis(BaseModel):
     error_lines: List[int]
 
 
-# =========================
+# ==================================================
 # Tool Function
-# =========================
+# ==================================================
 
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
@@ -62,51 +63,48 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = old_stdout
 
 
-# =========================
-# AI Analysis
-# =========================
+# ==================================================
+# AI PIPE ERROR ANALYSIS
+# ==================================================
 
 def analyze_error_with_ai(code: str, traceback_text: str) -> List[int]:
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    client = OpenAI(
+        api_key=os.environ.get("AIPIPE_API_KEY"),
+        base_url=os.environ.get("AIPIPE_BASE_URL")
+    )
 
     prompt = f"""
-Analyze this Python code and its error traceback.
-Identify the line number(s) where the error occurred.
+Analyze this Python code and its traceback.
+Return ONLY JSON in this format:
+
+{{ "error_lines": [line_numbers] }}
 
 CODE:
 {code}
 
 TRACEBACK:
 {traceback_text}
-
-Return ONLY the line number(s).
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-exp",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "error_lines": types.Schema(
-                        type=types.Type.ARRAY,
-                        items=types.Schema(type=types.Type.INTEGER),
-                    )
-                },
-                required=["error_lines"],
-            ),
-        ),
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",  # or whatever AI Pipe maps to
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"}
     )
 
-    result = ErrorAnalysis.model_validate_json(response.text)
+    result = ErrorAnalysis.model_validate_json(
+        response.choices[0].message.content
+    )
+
     return result.error_lines
 
 
-# =========================
+# ==================================================
 # Endpoint
-# =========================
+# ==================================================
 
 @app.post("/code-interpreter", response_model=CodeResponse)
 def code_interpreter(request: CodeRequest):
@@ -114,7 +112,10 @@ def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
 
     if execution["success"]:
-        return CodeResponse(error=[], result=execution["output"])
+        return CodeResponse(
+            error=[],
+            result=execution["output"]
+        )
 
     error_lines = analyze_error_with_ai(
         request.code,
